@@ -41,6 +41,7 @@
   .input-group input, .input-group select { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; color: var(--text); font-family: var(--mono); font-size: 12px; outline: none; transition: border-color 0.2s; }
   .input-group input:focus, .input-group select:focus { border-color: var(--accent); }
   .input-group select option { background: var(--surface); }
+  .input-group select option.highlight { font-weight: bold; color: var(--accent3); }
 
   .google-btn { display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; padding: 11px; background: #fff; border: none; border-radius: 8px; color: #333; font-family: var(--font); font-size: 13px; font-weight: 700; cursor: pointer; transition: opacity 0.2s; }
   .google-btn:hover { opacity: 0.88; }
@@ -179,6 +180,7 @@
       <div class="input-group">
         <label>Aba</label>
         <select id="sheet-tab">
+          <option value="TODAS" class="highlight">🌟 Todas as Abas (Geral)</option>
           <option value="Adjunto e Coordenadora">Adjunto e Coordenadora</option>
           <option value="Urbanístico Patrimonial">Urbanístico Patrimonial</option>
           <option value="Pessoal Diversos">Pessoal Diversos</option>
@@ -305,23 +307,76 @@ function signOut() {
 // ── LOAD ──────────────────────────────────────────────────────
 async function loadData() {
   if (!S.token) { alert('Faça login primeiro.'); return; }
-  const sid = $('sheet-id').value.trim(), tab = $('sheet-tab').value;
+  const sid = $('sheet-id').value.trim();
+  const selTab = $('sheet-tab').value;
+  
+  // Decide se busca uma aba só ou todas as abas listadas
+  const tabsToFetch = selTab === 'TODAS' 
+    ? Array.from($('sheet-tab').options).map(o=>o.value).filter(v=>v!=='TODAS')
+    : [selTab];
+
   setStatus('loading','Carregando...');
-  $('mc').innerHTML = '<div class="loading-wrap"><div class="spinner"></div><p style="color:var(--muted);font-size:13px">Lendo planilha...</p></div>';
+  $('mc').innerHTML = '<div class="loading-wrap"><div class="spinner"></div><p style="color:var(--muted);font-size:13px">Lendo planilha(s)...</p></div>';
+  
   try {
-    const res  = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sid}/values/${encodeURIComponent(tab)}`,
-      { headers: { Authorization: `Bearer ${S.token}` } });
-    const json = await res.json();
-    if (!res.ok) throw new Error(json.error?.message||'Erro desconhecido');
-    const rows = json.values||[];
-    let hi=0,mf=0;
-    rows.slice(0,5).forEach((r,i)=>{ const f=r.filter(Boolean).length; if(f>mf){mf=f;hi=i;} });
-    S.headers = rows[hi].map(h=>String(h).trim());
-    S.raw = rows.slice(hi+1).filter(r=>r.some(Boolean)).map(r=>{
-      const o={}; S.headers.forEach((h,i)=>o[h]=r[i]||''); return o;
-    });
-    S.loaded=true;
-    setStatus('ok',`${S.raw.length} registros — ${tab}`);
+    // Dispara requisições para todas as abas necessárias em paralelo
+    const requests = tabsToFetch.map(tab => 
+      fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sid}/values/${encodeURIComponent(tab)}`,
+      { headers: { Authorization: `Bearer ${S.token}` } })
+      .then(res => res.json().then(data => ({ ok: res.ok, data, tab })))
+    );
+    const results = await Promise.all(requests);
+
+    S.raw = [];
+    let allHeaders = new Set();
+
+    for (const item of results) {
+      if (!item.ok) throw new Error(item.data.error?.message || `Erro na aba ${item.tab}`);
+      const rows = item.data.values || [];
+      if(!rows.length) continue;
+
+      let hi=0,mf=0;
+      rows.slice(0,5).forEach((r,i)=>{ const f=r.filter(Boolean).length; if(f>mf){mf=f;hi=i;} });
+      const headers = rows[hi].map(h=>String(h).trim());
+      headers.forEach(h => allHeaders.add(h));
+
+      // Mapeamento interno das chaves para padronizar caso haja diferenças entre abas
+      const f=(...c)=>headers.find(x=>c.some(k=>x.toLowerCase().includes(k.toLowerCase())))||'';
+      const mapKeys = {
+        en: f('ENTRADA','Recebi'),
+        sa: f('DATA DEVOLUÇÃO','Conclusão','DEVOLUÇÃO','Saída'),
+        pr: f('PROCURADOR','Procurador'),
+        se: f('Origem','SETOR'),
+        as: f('Descrição','ASSUNTO','assunto'),
+        pa: f('Parte','PROCESSO/ PARTE','Interessado'),
+        pc: f('PGM','nº PGM','Processo'),
+        st: f('Situação','situação'),
+        pv: f('PROVIDÊNCIA','Providência'),
+      };
+
+      const tabData = rows.slice(hi+1).filter(r=>r.some(Boolean)).map(r=>{
+        const o={ _aba: item.tab };
+        headers.forEach((h,i) => o[h] = r[i] || '');
+        // Chaves internas padronizadas
+        o._entrada = o[mapKeys.en] || '';
+        o._saida = o[mapKeys.sa] || '';
+        o._procurador = o[mapKeys.pr] || '';
+        o._setor = o[mapKeys.se] || '';
+        o._assunto = o[mapKeys.as] || '';
+        o._parte = o[mapKeys.pa] || '';
+        o._processo = o[mapKeys.pc] || '';
+        o._situacao = o[mapKeys.st] || '';
+        o._providencia = o[mapKeys.pv] || '';
+        return o;
+      });
+      S.raw.push(...tabData);
+    }
+    
+    S.headers = Array.from(allHeaders).filter(h => !h.startsWith('_'));
+    S.loaded = true;
+    
+    const labelStatus = selTab === 'TODAS' ? 'Todas as Abas' : selTab;
+    setStatus('ok', `${S.raw.length} registros — ${labelStatus}`);
     showReport('geral');
   } catch(e) {
     setStatus('error','Erro');
@@ -343,19 +398,19 @@ const yov  = v => { const d=parseDate(v); return d?d.getFullYear():null; };
 const cntBy= (arr,fn) => { const m={}; arr.forEach(r=>{const k=fn(r);if(k)m[k]=(m[k]||0)+1;}); return m; };
 const topN = (o,n=15) => Object.entries(o).sort((a,b)=>b[1]-a[1]).slice(0,n);
 
+// Agora 'cols' usa os campos internos normalizados independentemente da aba carregada
 function cols() {
-  const h=S.headers||[];
-  const f=(...c)=>h.find(x=>c.some(k=>x.toLowerCase().includes(k.toLowerCase())))||'';
   return {
-    entrada:    f('ENTRADA','Recebi'),
-    saida:      f('DATA DEVOLUÇÃO','Conclusão','DEVOLUÇÃO','Saída'),
-    procurador: f('PROCURADOR','Procurador'),
-    setor:      f('Origem','SETOR'),
-    assunto:    f('Descrição','ASSUNTO','assunto'),
-    parte:      f('Parte','PROCESSO/ PARTE','Interessado'),
-    processo:   f('PGM','nº PGM','Processo'),
-    situacao:   f('Situação','situação'),
-    providencia:f('PROVIDÊNCIA','Providência'),
+    entrada: '_entrada',
+    saida: '_saida',
+    procurador: '_procurador',
+    setor: '_setor',
+    assunto: '_assunto',
+    parte: '_parte',
+    processo: '_processo',
+    situacao: '_situacao',
+    providencia: '_providencia',
+    aba: '_aba'
   };
 }
 
@@ -461,9 +516,11 @@ function rGeral(m,c){
   const byM=cntBy(data,r=>mkv(r[c.entrada]));
   const rec=Object.entries(byM).sort((a,b)=>a[0].localeCompare(b[0])).slice(-12);
   const mx=rec.length?Math.max(...rec.map(x=>x[1])):1;
+  const currTabTitle = $('sheet-tab').options[$('sheet-tab').selectedIndex].text;
+  
   m.innerHTML=`
     <div class="report-header">
-      <div class="report-title"><h2>🏠 Painel Geral</h2><p>${$('sheet-tab').value} — ${data.length} registros</p></div>
+      <div class="report-title"><h2>🏠 Painel Geral</h2><p>${currTabTitle} — ${data.length} registros</p></div>
       <button class="btn-export" onclick="exportCSV()">⬇️ Exportar CSV</button>
     </div>
     ${renderStats([
@@ -629,23 +686,43 @@ function rTodos(m,c){
     <div id="rb"></div>`;
   updTodos(c);
 }
+
 function updTodos(c){
   const monthly=gf(c.entrada);
   const s=($('fsearch')||{}).value?.toLowerCase()||'';
   const d=s?monthly.filter(r=>Object.values(r).some(v=>String(v).toLowerCase().includes(s))):monthly;
-  $('rb').innerHTML=tbl('Registros',d,[
-    {key:c.processo,label:'PGM',cls:'mono'},{key:c.entrada,label:'Entrada',fmt:fmtD},
-    {key:c.procurador,label:'Procurador',cls:'accent'},{key:c.setor,label:'Origem'},
-    {key:c.assunto,label:'Assunto',cls:'wrap'},{key:c.saida,label:'Saída',fmt:fmtD},
-    {key:c.situacao,label:'Situação',fmt:v=>v?`<span class="badge ${v.toLowerCase().includes('conclu')?'badge-green':'badge-warn'}">${v}</span>`:'—'},
-  ]);
+  
+  const colDefs = [
+    {key:c.processo,label:'PGM',cls:'mono'},
+    {key:c.entrada,label:'Entrada',fmt:fmtD},
+    {key:c.procurador,label:'Procurador',cls:'accent'},
+    {key:c.setor,label:'Origem'}
+  ];
+  
+  // Se está visualizando o geral, adiciona uma coluna pra mostrar de qual aba o registro veio
+  if ($('sheet-tab').value === 'TODAS') {
+    colDefs.push({key:c.aba, label:'Aba', fmt:v=>`<span class="tc" style="font-size:10px">${v}</span>`});
+  }
+
+  colDefs.push(
+    {key:c.assunto,label:'Assunto',cls:'wrap'},
+    {key:c.saida,label:'Saída',fmt:fmtD},
+    {key:c.situacao,label:'Situação',fmt:v=>v?`<span class="badge ${v.toLowerCase().includes('conclu')?'badge-green':'badge-warn'}">${v}</span>`:'—'}
+  );
+
+  $('rb').innerHTML=tbl('Registros',d, colDefs);
 }
 
 function exportCSV(){
   const data=S.raw; if(!data.length)return;
-  const h=Object.keys(data[0]);
-  const rows=[h,...data.map(r=>h.map(k=>`"${String(r[k]||'').replace(/"/g,'""')}"`))]
-    .map(r=>r.join(',')).join('\n');
+  // Exporta todas as colunas reais encontradas (ignorando as internas começando com _)
+  const h=S.headers;
+  const exportHeaders = ['Aba Original', ...h];
+  
+  const rows=[exportHeaders,...data.map(r=> {
+    return [`"${r._aba}"`, ...h.map(k=>`"${String(r[k]||'').replace(/"/g,'""')}"`)];
+  })].map(r=>r.join(',')).join('\n');
+  
   const a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob(['\uFEFF'+rows],{type:'text/csv;charset=utf-8;'}));
   a.download=`PAA_${$('sheet-tab').value.replace(/\s/g,'_')}_${new Date().toISOString().slice(0,10)}.csv`;
